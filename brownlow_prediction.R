@@ -187,16 +187,363 @@ df1 <- df %>%
          shots_at_goal_pctg_game = shots_at_goal/shots_at_goal_game,
          spoils_pctg_team = spoils/spoils_team,
          spoils_pctg_game = spoils/spoils_game,
+         won_game = ifelse(as.character(match_winner)== as.character(player_team),1,0),
          three_votes = ifelse(brownlow_votes==3,1,0),
          two_votes = ifelse(brownlow_votes==2,1,0),
          one_votes = ifelse(brownlow_votes==1,1,0)) %>%
   ungroup()
 
-#interaction_features development
-
-
-
-
+#developing datasets for training and testing
 #training_dataset - df1 before 2024
-train_df <- df1 %>% filter()
+train_df <- df1 %>% filter(year(match_date) < 2024) %>% select(-brownlow_votes)
+#testing_dataset - df1 for 2024
+test_df <- df1 %>% filter(year(match_date) == 2024) %>% select(-brownlow_votes)
+prediction_df <- df1 %>% filter(year(match_date) == 2025) %>% select(-brownlow_votes)
+
+brownlow_results <- df1 %>% select(match_id, player_id, brownlow_votes)
+
+#developing assessment for most important variables
+correlations <- cor(train_df[sapply(train_df, is.numeric)], use = "complete.obs")
+target_cors <- correlations[, target_var]
+target_cors <- target_cors[!is.na(target_cors)]
+target_cors <- target_cors[names(target_cors) != target_var]
+
+# Sort by absolute correlation
+target_cors_sorted <- sort(abs(target_cors), decreasing = TRUE)
+
+# Plot correlations
+cor_df <- data.frame(
+  Feature = names(target_cors_sorted),
+  Correlation = as.numeric(target_cors_sorted)
+)
+
+p2 <- ggplot(head(cor_df, 20), aes(x = reorder(Feature, Correlation), 
+                                   y = Correlation)) +
+  geom_bar(stat = "identity", fill = "coral") +
+  coord_flip() +
+  labs(title = "Top Features by Correlation with Target",
+       x = "Features", y = "Absolute Correlation") +
+  theme_minimal()
+
+print(p2)
+
+
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(glmnet)
+library(corrplot)
+library(pROC)
+
+# Assuming your dataframe is called 'fin_df'
+# If not, replace 'fin_df' with your actual dataframe name
+
+# ==============================================================================
+# DATA PREPROCESSING
+# ==============================================================================
+
+# Create target variable (home team win probability)
+#training_dataset - df1 before 2023
+### doing this to build a 3 point model which is basically a player strength of game model, and then
+train_df <- df1 %>% filter(year(match_date) < 2023) %>% select(-brownlow_votes)
+#testing_dataset - df1 for 2024
+test_df <- df1 %>% filter(year(match_date) == 2024) %>% select(-brownlow_votes)
+prediction_df <- df1 %>% filter(year(match_date) == 2025) %>% select(-brownlow_votes)
+
+t_df <- rbind(train_df, test_df)
+t_df$target <- t_df$three_votes
+# Create modeling dataset
+model_data <- t_df[, c(names(target_cors), 'target')] %>%
+  na.omit()
+
+# Check for missing values
+cat("Missing values per column:\n")
+print(colSums(is.na(model_data)))
+
+
+# Select final features - focus on most predictive pitcher metrics
+final_features <- c(
+  # Core performance metrics
+  'coaches_votes', 'coaches_votes_pctg_game', 'coaches_votes_pctg_team', 'supercoach_score',
+  
+  # Pitcher quality differentials
+  'supercoach_pctg_game', 'afl_fantasy_pctg_game', 'afl_fantasy_score',
+  'supercoach_pctg_team', 'afl_fantasy_pctg_team', 'disposals_pctg_game',
+  'rating_points_pctg_game', 'disposals', 'rating_points',
+  
+  # Workload and experience
+  'contested_possessions_pctg_game', 'contested_possessions', 'disposals_pctg_team',
+  
+  # Composite metrics
+  'contested_possessions_pctg_team', 'score_involvements_pctg_game',
+  
+  # Market integration
+  'rating_points_pctg_team', 'score_involvements', 'effective_disposals_pctg_game',
+  
+  # Key interactions
+  'clearances_pctg_game', 'clearances', 'effective_disposals',
+  'kicks_pctg_game', 'kicks', 'goals', 'points_scored', 'handballs_pctg_game',
+  'metres_gained', 'metres_gained_pctg_game', 'tackles', 'tackles_pctg_game','handballs',
+  'centre_clearances_pctg_game', 'centre_clearances', 'marks', 'marks_pctg_game',
+  'is_midfielder',
+  
+  
+  'target'
+)
+
+model_data_final <- model_data[, final_features] %>%
+  na.omit()
+
+cat(sprintf("Final dataset shape: %d rows, %d features\n", 
+            nrow(model_data_final), ncol(model_data_final)-1))
+
+# ==============================================================================
+# TRAIN-TEST SPLIT
+# ==============================================================================
+
+set.seed(42)
+#train_index <- createDataPartition(model_data_final$target, p = 0.8, list = FALSE)
+train_data <- model_data_final[model_data$season<2023, ]
+test_data <- model_data_final[model_data$season>=2023, ]
+
+# Prepare feature matrices
+X_train <- train_data[, !names(train_data) %in% 'target']
+y_train <- train_data$target
+X_test <- test_data[, !names(test_data) %in% 'target']
+y_test <- test_data$target
+
+cat(sprintf("Training set: %d samples\n", nrow(train_data)))
+cat(sprintf("Test set: %d samples\n", nrow(test_data)))
+cat(sprintf("Target distribution - Train: %.2f%% home wins\n", mean(y_train) * 100))
+cat(sprintf("Target distribution - Test: %.2f%% home wins\n", mean(y_test) * 100))
+
+
+# ==============================================================================
+# MODEL 3: GRADIENT BOOSTING (XGBoost)
+# ==============================================================================
+
+cat("\n=== MODEL 3: XGBOOST ===\n")
+
+# Prepare data for XGBoost
+dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+dtest <- xgb.DMatrix(data = as.matrix(X_test), label = y_test)
+
+# Optimized parameters for pitcher-focused modeling
+xgb_params <- list(
+  objective = "binary:logistic",
+  eta = 0.1,
+  max_depth = 6,
+  min_child_weight = 1,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  eval_metric = "auc",
+  alpha = 0.1,  # L1 regularization
+  lambda = 1    # L2 regularization
+)
+
+# Train XGBoost model
+xgb_model <- xgb.train(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = 200,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 20,
+  verbose = 0
+)
+
+# Predictions
+xgb_pred_prob <- predict(xgb_model, dtest)
+xgb_pred_class <- ifelse(xgb_pred_prob > 0.5, 1, 0)
+
+# Evaluate
+xgb_accuracy <- mean(xgb_pred_class == y_test)
+xgb_auc <- auc(roc(y_test, xgb_pred_prob))
+
+cat(sprintf("XGBoost - Accuracy: %.4f, AUC: %.4f\n", xgb_accuracy, xgb_auc))
+
+# Feature importance
+xgb_importance <- xgb.importance(model = xgb_model)
+cat("\nTop 10 Most Important Features (XGBoost):\n")
+print(head(xgb_importance, 10))
+
+##### now doing rans:pairwise to see how predictions look
+################################################################
+################################################################
+
+
+
+
+
+### doing this to build a 3 point model which is basically a player strength of game model, and then
+#df1$target <- df1$brownlow_votes
+train_df <- df1 %>% filter(year(match_date) < 2023)
+#testing_dataset - df1 for 2024
+test_df <- df1 %>% filter(year(match_date) == 2024)
+prediction_df <- df1 %>% filter(year(match_date) == 2025) %>% select(-brownlow_votes)
+# Create modeling dataset
+t_df <- rbind(train_df, test_df)
+t_df$target <- t_df$brownlow_votes
+model_data <- t_df[, c(names(target_cors), 'target')] %>%
+  na.omit()
+
+# Check for missing values
+cat("Missing values per column:\n")
+print(colSums(is.na(model_data)))
+
+
+# Select final features - focus on most predictive pitcher metrics
+final_features <- c(
+  # Core performance metrics
+  'coaches_votes', 'coaches_votes_pctg_game', 'coaches_votes_pctg_team', 'supercoach_score',
+  
+  # Pitcher quality differentials
+  'supercoach_pctg_game', 'afl_fantasy_pctg_game', 'afl_fantasy_score',
+  'supercoach_pctg_team', 'afl_fantasy_pctg_team', 'disposals_pctg_game',
+  'rating_points_pctg_game', 'disposals', 'rating_points',
+  
+  # Workload and experience
+  'contested_possessions_pctg_game', 'contested_possessions', 'disposals_pctg_team',
+  
+  # Composite metrics
+  'contested_possessions_pctg_team', 'score_involvements_pctg_game',
+  
+  # Market integration
+  'rating_points_pctg_team', 'score_involvements', 'effective_disposals_pctg_game',
+  
+  # Key interactions
+  'clearances_pctg_game', 'clearances', 'effective_disposals',
+  'kicks_pctg_game', 'kicks', 'goals', 'points_scored', 'handballs_pctg_game',
+  'metres_gained', 'metres_gained_pctg_game', 'tackles', 'tackles_pctg_game','handballs',
+  'centre_clearances_pctg_game', 'centre_clearances', 'marks', 'marks_pctg_game',
+  'is_midfielder',
+  
+  
+  'target','match_id'
+)
+
+model_data_final <- model_data[, final_features] %>%
+  na.omit()
+
+cat(sprintf("Final dataset shape: %d rows, %d features\n", 
+            nrow(model_data_final), ncol(model_data_final)-1))
+
+set.seed(42)
+#train_index <- createDataPartition(model_data_final$target, p = 0.8, list = FALSE)
+train_data <- model_data_final[model_data$season<2023, ]
+test_data <- model_data_final[model_data$season>=2023, ]
+
+
+# Prepare feature matrices
+X_train <- train_data[, !names(train_data) %in% 'target']
+y_train <- train_data$target
+X_test <- test_data[, !names(test_data) %in% 'target']
+y_test <- test_data$target
+
+cat(sprintf("Training set: %d samples\n", nrow(train_data)))
+cat(sprintf("Test set: %d samples\n", nrow(test_data)))
+cat(sprintf("Target distribution - Train: %.2f%% home wins\n", mean(y_train) * 100))
+cat(sprintf("Target distribution - Test: %.2f%% home wins\n", mean(y_test) * 100))
+
+
+# ==============================================================================
+# MODEL 3: GRADIENT BOOSTING (XGBoost)
+# ==============================================================================
+
+cat("\n=== MODEL 3: XGBOOST ===\n")
+#getting groups
+library(dplyr)
+train_groups <- train_data %>%
+  group_by(match_id) %>%
+  summarise(group_size = n()) %>%
+  pull(group_size)
+
+test_groups <- test_data %>%
+  group_by(match_id) %>%
+  summarise(group_size = n()) %>%
+  pull(group_size)
+
+# Prepare data for XGBoost
+dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train, group=train_groups)
+dtest <- xgb.DMatrix(data = as.matrix(X_test), label = y_test, group = test_groups)
+
+# Optimized parameters for pitcher-focused modeling
+xgb_params <- list(
+  objective = "rank:map",
+  eta = 0.1,
+  max_depth = 6,
+  min_child_weight = 1,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  eval_metric = "rmse",
+  alpha = 0.1,  # L1 regularization
+  lambda = 1    # L2 regularization
+)
+
+# Train XGBoost model
+xgb_model <- xgb.train(
+  params = xgb_params,
+  data = dtrain,
+  nrounds = 200,
+  watchlist = list(train = dtrain, test = dtest),
+  early_stopping_rounds = 20,
+  verbose = 0
+)
+
+# Predictions
+xgb_pred_prob <- predict(xgb_model, dtest)
+xgb_pred_class <- ifelse(xgb_pred_prob > 0.5, 1, 0)
+
+# Evaluate
+xgb_accuracy <- mean(xgb_pred_class == y_test)
+xgb_auc <- auc(roc(y_test, xgb_pred_prob))
+
+cat(sprintf("XGBoost - Accuracy: %.4f, AUC: %.4f\n", xgb_accuracy, xgb_auc))
+
+# Feature importance
+xgb_importance <- xgb.importance(model = xgb_model)
+cat("\nTop 10 Most Important Features (XGBoost):\n")
+print(head(xgb_importance, 10))
+
+
+
+
+
+library(caret)
+library(randomForest)
+
+data_clean <- train_df[complete.cases(train_df), ]
+
+# Separate features and target
+features <- data_clean[, !names(data_clean) %in% target_var]
+target <- data_clean[[target_var]]
+
+# Train Random Forest
+rf_model <- randomForest(x = features, y = target, 
+                         importance = TRUE, 
+                         ntree = 500)
+
+# Extract importance scores
+importance_scores <- importance(rf_model)
+importance_df <- data.frame(
+  Feature = rownames(importance_scores),
+  MeanDecreaseAccuracy = importance_scores[, "MeanDecreaseAccuracy"],
+  MeanDecreaseGini = importance_scores[, "MeanDecreaseGini"]
+)
+
+# Sort by Mean Decrease Accuracy
+importance_df <- importance_df[order(-importance_df$MeanDecreaseAccuracy), ]
+
+# Plot top features
+top_features <- head(importance_df, top_n)
+
+p1 <- ggplot(top_features, aes(x = reorder(Feature, MeanDecreaseAccuracy), 
+                               y = MeanDecreaseAccuracy)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top Features by Mean Decrease Accuracy",
+       x = "Features", y = "Mean Decrease Accuracy") +
+  theme_minimal()
+
+print(p1)
 
